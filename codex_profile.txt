@@ -1,0 +1,5 @@
+# Optional: put a Codex profile name on the first line to scope sessions for this project.
+# Lines starting with # are ignored. Leave empty to use the default profile.
+# Example: i2pc
+i2pc
+

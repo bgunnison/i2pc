@@ -15,8 +15,18 @@ A small Python app for Windows that copies media from a USB‑connected iPhone t
   - `subfolders`: Recurse into subfolders.
   - `preserve_subfolders`: Keep the immediate parent folder name under destination.
   - `verified_file`: Name of the verification ledger (default `verified.txt`).
-- Run the app:
-  - `python -m src.i2pc` or `python src/i2pc.py`
+- Run the app (REPL):
+  - `python src/i2pc.py`
+  - Commands:
+    - `copy`   — Copy all photos to `destination` (uses fast-skip per config).
+    - `verify` — Recompute SHA-256 for each destination file and rebuild `verified.txt`.
+    - `update` — Copy new or size-changed files; keep both by auto-numbering (Windows-style).
+    - `date`   — Create a `date` directory containing files sorted by date.
+    - `location` — Create a `location` directory grouping files with GPS into `Country/State/City[/YYYY-MM]`. Uses reverse geocoding; ignores files with no GPS.
+    - `remdupe` — Delete duplicate files.
+    - `iinfo *` — Show file info for all files on the iPhone, or choose a subset via `*.jpg` (for example).
+    - `pcinfo *` — Show file info for all files in destination, or choose a subset via `*.jpg` (for example).
+    - `quit`   — Exit.
 
 ## What “verification” means here
 
@@ -34,3 +44,21 @@ A small Python app for Windows that copies media from a USB‑connected iPhone t
 
 - One entry per line: `<sha256>\t<relative_path>`
 - Relative paths are recorded using forward slashes.
+
+## Reference views (browsable links)
+
+- Enable optional reference directories under your destination by adding to `config.json`:
+  - `"reference_views": ["date"]` to build a `date/` folder with subfolders `YYYY-MM-DD` containing links to your media.
+  - Optionally set `"reference_link_type"` to one of `"hardlink"` (default), `"symlink"`, or `"copy"` (fallback when links fail).
+- Notes:
+  - Date is derived from EXIF `DateTimeOriginal` when possible (JPEG); otherwise file modified time is used.
+  - Hardlinks require the destination and view to be on the same NTFS volume. If link creation fails, the app falls back to copying as a last resort.
+
+## Faster skipping (avoid copying when unchanged)
+
+- Add `"fast_skip"` to `config.json` to control pre-copy skip checks when a destination file already exists:
+  - `"ledger"`: Skip if the file path is present in `verified.txt` (assumes previously verified file is still valid).
+  - `"size"`: Skip if the iPhone reports a `Size` that matches the destination file size.
+  - `"ledger_or_size"` (default): Use either of the above to skip early.
+  - `"none"`: Always perform staged copy + hash comparison.
+- Note: Windows MTP does not support hashing files in-place on the device; a staged copy is required for byte-level comparison. The above options reduce transfers when files are likely unchanged.
