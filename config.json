@@ -1,22 +1,23 @@
 ﻿{
-    "source_names":  [
-                         "Apple iPhone",
-                         "Internal Storage"
-                     ],
-    "include_patterns":  [
-                             "*.jpg",
-                             "*.jpeg",
-                             "*.png",
-                             "*.heic",
-                             "*.mov",
-                             "*.mp4"
-                         ],
-    "destination":  "C:\\projects\\i2pc\\media",
-    "subfolders":  true,
-    "preserve_subfolders":  false,
-    "verified_file":  "verified.txt",
-    "skip_existing":  true,
-    "reference_views":  [
-                            "date"
-                        ]
+    "source_names": [
+        "Apple iPhone",
+        "Internal Storage"
+    ],
+    "include_patterns": [
+        "*.jpg",
+        "*.jpeg",
+        "*.png",
+        "*.heic",
+        "*.mov",
+        "*.mp4"
+    ],
+    "destination": "C:\\projects\\i2pc\\media",
+    "subfolders": true,
+    "preserve_subfolders": false,
+    "verified_file": "verified.txt",
+    "skip_existing": true,
+    "reference_views": [
+        "date"
+    ],
+    "aicategory_timeout_s": 40
 }

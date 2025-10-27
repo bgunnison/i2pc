@@ -15,6 +15,7 @@ A small Python app for Windows that copies media from a USB‑connected iPhone t
   - `subfolders`: Recurse into subfolders.
   - `preserve_subfolders`: Keep the immediate parent folder name under destination.
   - `verified_file`: Name of the verification ledger (default `verified.txt`).
+  - Do not store secrets here. Put your `OPENAI_API_KEY` in `private.json` (see below).
 - Run the app (REPL):
   - `python src/i2pc.py`
   - Commands:
@@ -22,10 +23,12 @@ A small Python app for Windows that copies media from a USB‑connected iPhone t
     - `verify` — Recompute SHA-256 for each destination file and rebuild `verified.txt`.
     - `update` — Copy new or size-changed files; keep both by auto-numbering (Windows-style).
     - `date`   — Create a `date` directory containing files sorted by date.
+    - `category` — Create a `category` directory grouping JPGs by content using an AI model. Requires `OPENAI_API_KEY` in `private.json`, and in `aicategorize.json` provide a JSON object containing the model and a system message, e.g.: `{ "model": "gpt-4o-mini", "messages":[{"role":"system","content":"<your instruction>"}] }`. Each JPG is thumbnailed (~320px) before sending. On timeout or API error, the photo is placed under `category/unknown`.
     - `location` — Create a `location` directory grouping files with GPS into `Country/State/City[/YYYY-MM]`. Uses reverse geocoding; ignores files with no GPS.
     - `remdupe` — Delete duplicate files.
     - `iinfo *` — Show file info for all files on the iPhone, or choose a subset via `*.jpg` (for example).
     - `pcinfo *` — Show file info for all files in destination, or choose a subset via `*.jpg` (for example).
+    - `verbose [on|off]` — Toggle verbose debug output (prints AI request metadata and payload sizes; never prints API key).
     - `quit`   — Exit.
 
 ## What “verification” means here
@@ -39,6 +42,22 @@ A small Python app for Windows that copies media from a USB‑connected iPhone t
 - If `pywin32` is not installed, install it with `pip install pywin32`.
 - The app uses Windows Shell COM and works only on Windows.
 - If a filename collision occurs, Windows may auto‑rename the copied file (e.g., `IMG_0001 (2).JPG`). The app detects the new file by monitoring destination changes.
+
+- Category view:
+  - Put your OpenAI key in `private.json` as `{ "OPENAI_API_KEY": "sk-..." }`. Optionally set `"aicategory_timeout_s"` (seconds) in `config.json`.
+  - In `aicategorize.json`, provide JSON with the model and a system message as shown above.
+  - The model should return a category string (plain text) or `{ "category": "..." }`.
+  - Only `.jpg/.jpeg` files are categorized for now. Others are ignored.
+  - Optional: set `"https_proxy"` in `config.json` to route AI requests through your proxy, e.g. `"https_proxy": "http://user:pass@host:port"`.
+
+- Destination scanning:
+  - The app scans only the top-level files in your destination (media) directory when verifying or building views (date, location, category). It does not recurse into subdirectories. Generated view directories are excluded automatically.
+
+## Secrets
+
+- Create `private.json` at the repo root and add:
+  - `{ "OPENAI_API_KEY": "sk-..." }`
+- `private.json` is listed in `.gitignore` and is not committed.
 
 ## verified.txt format
 

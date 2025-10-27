@@ -8,10 +8,18 @@ import argparse
 import difflib
 import signal
 import shutil
+import base64
+import io
 from datetime import datetime
 from pathlib import Path
 import re
 import math
+from typing import Optional
+
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None
 
 
 class NavigationError(Exception):
@@ -29,10 +37,40 @@ def _norm_text(s: str) -> str:
 
 
 def load_config(path: Path) -> dict:
-    # Use utf-8-sig to tolerate files saved with BOM (e.g., via PowerShell Set-Content -Encoding UTF8)
-    with path.open('r', encoding='utf-8-sig') as f:
-        cfg = json.load(f)
-    return cfg
+    """Load JSON config with friendly error messages.
+    - UTF-8 with BOM tolerated
+    - On JSON errors, prints a concise message with line/column and a code snippet
+    """
+    try:
+        text = path.read_text(encoding='utf-8-sig')
+    except FileNotFoundError:
+        print(f"ERROR: Missing config file: {path}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Cannot read {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Build a small snippet with caret
+        lines = text.splitlines()
+        ln = e.lineno or 1
+        col = e.colno or 1
+        start = max(1, ln - 1)
+        end = min(len(lines), ln + 1)
+        print(f"ERROR: Invalid JSON in {path.name} at line {ln}, column {col}: {e.msg}", file=sys.stderr)
+        for i in range(start, end + 1):
+            try:
+                prefix = ">>" if i == ln else "  "
+                print(f"{prefix} {i:>4}: {lines[i-1]}", file=sys.stderr)
+                if i == ln:
+                    caret = " " * (col + 6) + "^"
+                    print(caret, file=sys.stderr)
+            except Exception:
+                pass
+        print("Hints: JSON does not allow trailing commas, comments, or single quotes.", file=sys.stderr)
+        print("       Remove any trailing comma after the last item/object and try again.", file=sys.stderr)
+        sys.exit(1)
 
 
 def sha256_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
@@ -259,6 +297,22 @@ def _iter_media_files(root: Path, patterns: list[str], exclude_dirs: set[Path]):
                 yield base_path / fname
 
 
+def _iter_media_files_shallow(root: Path, patterns: list[str], exclude_dirs: set[Path]):
+    """Yield only files in the immediate root directory (no recursion),
+    skipping excluded directories. Views are assumed to be excluded upstream.
+    """
+    root = root.resolve()
+    try:
+        for entry in root.iterdir():
+            try:
+                if entry.is_file() and _is_media_file(entry.name, patterns):
+                    yield entry
+            except Exception:
+                continue
+    except FileNotFoundError:
+        return
+
+
 def _get_date_key_for_path(path: Path) -> str:
     """Return YYYY-MM-DD for the media's date.
     Tries EXIF DateTimeOriginal via Pillow if available; falls back to mtime.
@@ -332,7 +386,7 @@ def build_reference_view_date(dest_root: Path, patterns: list[str], link_type: s
     exclude = {view_root}
     # Create map date_key -> list[Path]
     buckets: dict[str, list[Path]] = {}
-    for f in _iter_media_files(dest_root, patterns, exclude_dirs=exclude):
+    for f in _iter_media_files_shallow(dest_root, patterns, exclude_dirs=exclude):
         key = _get_date_key_for_path(f)
         buckets.setdefault(key, []).append(f)
 
@@ -406,7 +460,7 @@ def cmd_remdupe(cfg: dict) -> None:
     exclude_dirs.add(destination / '.i2pc_tmp')
 
     groups: dict[str, list[Path]] = {}
-    for f in _iter_media_files(destination, include_patterns, exclude_dirs):
+    for f in _iter_media_files_shallow(destination, include_patterns, exclude_dirs):
         groups.setdefault(_normalize_dup_key(f.name), []).append(f)
 
     to_delete: list[Path] = []
@@ -577,7 +631,7 @@ def build_location_view(dest_root: Path, patterns: list[str], link_type: str = '
     scanned = 0
     gps_found = 0
     unique_locs = 0
-    for f in _iter_media_files(dest_root, include_patterns, exclude_dirs):
+    for f in _iter_media_files_shallow(dest_root, include_patterns, exclude_dirs):
         scanned += 1
         # Only consider images that are likely to have EXIF GPS
         if f.suffix.lower() not in ('.jpg', '.jpeg', '.heic', '.heif', '.png'):
@@ -677,6 +731,392 @@ def cmd_location(cfg: dict):
     print("Building location reference view...")
     build_location_view(destination, include_patterns, link_type=link_type, view_name='location')
     print("Location view ready.")
+
+
+# -------------------- Category View (AI-assisted, JPG only) --------------------
+
+def _load_ai_category_inputs(repo_root: Path) -> tuple[Optional[str], Optional[str]]:
+    """Strictly load model and system prompt from aicategorize.json.
+    Expects JSON with at least: { "model": "...", "messages": [ {"role":"system","content":"..."}, ... ] }
+    Returns (model, prompt) or (None, None) on failure.
+    """
+    path = (repo_root / 'aicategorize.json')
+    if not path.exists():
+        return None, None
+    try:
+        obj = json.loads(path.read_text(encoding='utf-8-sig'))
+        if not isinstance(obj, dict):
+            return None, None
+        model = obj.get('model') if isinstance(obj.get('model'), str) else None
+        prompt = None
+        msgs = obj.get('messages')
+        if isinstance(msgs, list) and msgs:
+            first = msgs[0]
+            if isinstance(first, dict) and first.get('role') == 'system' and isinstance(first.get('content'), str):
+                prompt = first['content']
+        if model and prompt and model.strip() and prompt.strip():
+            return model.strip(), prompt.strip()
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _make_thumbnail_bytes(path: Path, max_size: int = 256) -> Optional[bytes]:
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(path) as im:
+            im.thumbnail((max_size, max_size))
+            out = io.BytesIO()
+            im.convert('RGB').save(out, format='JPEG', quality=80)
+            return out.getvalue()
+    except Exception:
+        return None
+
+
+def _call_openai_category(api_key: str, model: str, prompt: str, thumb_jpeg: bytes, timeout_s: float = 20.0, max_retries: int = 5, proxies: Optional[dict] = None, verbose: bool = False) -> tuple[Optional[str], Optional[str]]:
+    if not requests:
+        return None, "requests-not-installed"
+    url = 'https://api.openai.com/v1/chat/completions'
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    }
+    b64 = base64.b64encode(thumb_jpeg).decode('ascii')
+    body = {
+        'model': model,
+        'temperature': 0,
+        'messages': [
+            { 'role': 'system', 'content': prompt },
+            { 'role': 'user', 'content': [
+                { 'type': 'text', 'text': 'Categorize this photo.' },
+                { 'type': 'image_url', 'image_url': { 'url': f'data:image/jpeg;base64,{b64}' } }
+            ]}
+        ]
+    }
+    # Verbose preview of request (safe; no API key)
+    if verbose:
+        try:
+            body_json = json.dumps(body)
+            body_len = len(body_json)
+            print(f"DEBUG AI POST /v1/chat/completions | model={model} temp=0 body_bytes={body_len}", flush=True)
+            print(f"DEBUG system_len={len(prompt or '')}", flush=True)
+            # Print full system prompt for inspection (may be long)
+            print(f"DEBUG system_full: {(prompt or '').replace('\r','')}", flush=True)
+            print(f"DEBUG image_b64_len={len(b64)} proxies={'yes' if proxies else 'no'}", flush=True)
+        except Exception:
+            pass
+    delay = 1.0
+    last_err = None
+    for attempt in range(1, max_retries+1):
+        try:
+            resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout_s, proxies=proxies)
+            if resp.status_code == 200:
+                data = resp.json()
+                try:
+                    content = data['choices'][0]['message']['content']
+                    if not content:
+                        return None, "empty-response"
+                    # Accept plain text category or a small JSON object {"category":"..."}
+                    cat = None
+                    try:
+                        obj = json.loads(content)
+                        if isinstance(obj, dict) and 'category' in obj and isinstance(obj['category'], str):
+                            cat = obj['category']
+                    except Exception:
+                        cat = content.strip()
+                    if isinstance(cat, str) and cat.strip():
+                        return cat.strip(), None
+                except Exception:
+                    return None, "parse-error"
+            elif resp.status_code in (429, 500, 502, 503, 504):
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            else:
+                # Short friendly message
+                try:
+                    j = resp.json()
+                    msg = j.get('error', {}).get('message') if isinstance(j, dict) else None
+                except Exception:
+                    msg = None
+                short = (msg or resp.text or '').strip().replace('\n', ' ')
+                return None, f"HTTP {resp.status_code}: {short[:200]}"
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+            continue
+        except Exception as e:
+            last_err = f"{e.__class__.__name__}: {str(e)[:200]}"
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+    return None, (f"retry-exhausted: {last_err}" if last_err else "retry-exhausted")
+
+
+def _call_openai_category_batch(api_key: str, model: str, prompt: str, items: list[tuple[str, bytes]], timeout_s: float = 40.0, max_retries: int = 5, proxies: Optional[dict] = None, verbose: bool = False) -> tuple[Optional[dict[str, str]], Optional[str]]:
+    """Send a single chat.completions request with multiple thumbnails.
+    items: list of (id, thumb_jpeg)
+    Returns (labels_by_id, error)
+    """
+    if not requests:
+        return None, "requests-not-installed"
+    url = 'https://api.openai.com/v1/chat/completions'
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    }
+    user_content = []
+    for iid, tb in items:
+        b64 = base64.b64encode(tb).decode('ascii')
+        user_content.append({ 'type': 'text', 'text': f'id:{iid}' })
+        user_content.append({ 'type': 'image_url', 'image_url': { 'url': f'data:image/jpeg;base64,{b64}' } })
+    body = {
+        'model': model,
+        'temperature': 0,
+        'messages': [
+            { 'role': 'system', 'content': prompt },
+            { 'role': 'user', 'content': user_content }
+        ]
+    }
+    if verbose:
+        try:
+            body_json = json.dumps(body)
+            print(f"DEBUG AI BATCH POST | model={model} items={len(items)} body_bytes={len(body_json)}", flush=True)
+            print(f"DEBUG system_len={len(prompt or '')}", flush=True)
+        except Exception:
+            pass
+    delay = 1.0
+    last_err = None
+    for attempt in range(1, max_retries+1):
+        try:
+            resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout_s, proxies=proxies)
+            if resp.status_code == 200:
+                data = resp.json()
+                try:
+                    content = data['choices'][0]['message']['content']
+                    if not content:
+                        return None, "empty-response"
+                    labels: dict[str, str] = {}
+                    # Expect JSON like {"results":[{"id":"a001","label":"word"}, ...]}
+                    parsed = None
+                    try:
+                        parsed = json.loads(content)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict) and isinstance(parsed.get('results'), list):
+                        for r in parsed['results']:
+                            if isinstance(r, dict) and isinstance(r.get('id'), str) and isinstance(r.get('label'), str):
+                                labels[r['id']] = r['label']
+                        return labels, None
+                    # Fallback simple parse: split plain text by lines "id:label"
+                    lines = [ln.strip() for ln in str(content).splitlines() if ln.strip()]
+                    for ln in lines:
+                        if ':' in ln:
+                            iid, lab = ln.split(':', 1)
+                            labels[iid.strip()] = lab.strip()
+                    if labels:
+                        return labels, None
+                    return None, "unrecognized-response"
+                except Exception:
+                    return None, "parse-error"
+            elif resp.status_code in (429, 500, 502, 503, 504):
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            else:
+                try:
+                    j = resp.json()
+                    msg = j.get('error', {}).get('message') if isinstance(j, dict) else None
+                except Exception:
+                    msg = None
+                short = (msg or resp.text or '').strip().replace('\n', ' ')
+                return None, f"HTTP {resp.status_code}: {short[:200]}"
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+            continue
+        except Exception as e:
+            last_err = f"{e.__class__.__name__}: {str(e)[:200]}"
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+            continue
+    return None, (f"retry-exhausted: {last_err}" if last_err else "retry-exhausted")
+
+
+def _test_openai_api_connectivity(api_key: str, timeout_s: float = 5.0, proxies: Optional[dict] = None) -> tuple[bool, Optional[str]]:
+    """Quick connectivity/auth test to OpenAI API. Returns (ok, reason)."""
+    if not requests:
+        return False, "requests-not-installed"
+    url = 'https://api.openai.com/v1/models'
+    headers = { 'Authorization': f'Bearer {api_key}' }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout_s, proxies=proxies)
+        if resp.status_code == 200:
+            return True, None
+        try:
+            j = resp.json() if resp.content else {}
+            msg = (j.get('error', {}) or {}).get('message') if isinstance(j, dict) else None
+        except Exception:
+            msg = None
+        short = (msg or resp.text or '').strip().replace('\n',' ')
+        return False, f"HTTP {resp.status_code}: {short[:200]}"
+    except requests.exceptions.Timeout:
+        return False, "timeout"
+    except Exception as e:
+        return False, f"{e.__class__.__name__}: {str(e)[:200]}"
+
+
+def _sanitize_category(name: str) -> str:
+    s = (name or '').strip()
+    if not s:
+        return 'unknown'
+    s = s.replace('/', '_').replace('\\', '_').replace(':', '_')
+    s = s.replace(' ', '_').replace(',', '')
+    return s[:80]
+
+
+def cmd_category(cfg: dict, query: str = ""):
+    destination = Path(cfg.get('destination'))
+    link_type = str(cfg.get('reference_link_type', 'hardlink')).lower()
+    repo_root = Path.cwd()
+    # Strict inputs: model and prompt from aicategorize.json; key from config OPENAI_API_KEY
+    model, prompt = _load_ai_category_inputs(repo_root)
+    # Read private key only from private.json (not from config.json)
+    def _load_private_key(root: Path) -> Optional[str]:
+        p = root / 'private.json'
+        if not p.exists():
+            return None
+        try:
+            obj = json.loads(p.read_text(encoding='utf-8-sig'))
+            if isinstance(obj, dict):
+                key = obj.get('OPENAI_API_KEY')
+                if isinstance(key, str) and key.strip():
+                    return key.strip()
+        except Exception:
+            return None
+        return None
+    api_key = _load_private_key(repo_root)
+    ensure_dir(destination)
+    if not api_key:
+        print("ERROR: OPENAI_API_KEY missing in private.json", file=sys.stderr)
+        return
+    if not requests:
+        print("ERROR: requests package not installed. pip install requests", file=sys.stderr)
+        return
+    if not (model and prompt):
+        print("ERROR: aicategorize.json missing or invalid (require {\"model\":\"...\", \"messages\":[{\"role\":\"system\",\"content\":\"...\"}]})", file=sys.stderr)
+        return
+
+    view_root = destination / 'category'
+    _ensure_empty_dir(view_root)
+
+    include_patterns = ["*.jpg", "*.jpeg"]
+    exclude_dirs: set[Path] = {view_root, destination / '.i2pc_tmp'}
+
+    # Optional HTTPS proxy from config
+    proxy_url = cfg.get('https_proxy')
+    proxies = {'https': str(proxy_url)} if proxy_url else None
+    # Connection preflight with friendly status
+    line = f"Using model: {model}, testing connection"
+    if proxies:
+        line += " via proxy"
+    print(line + "...", end="", flush=True)
+    ok, reason = _test_openai_api_connectivity(api_key, timeout_s=5.0, proxies=proxies)
+    if not ok:
+        print("")
+        print(f"ERROR: Cannot reach OpenAI API ({reason}). Check VPN/proxy/firewall or set HTTPS_PROXY. Aborting.", file=sys.stderr)
+        return
+    print(", connection OK...")
+    count = 0
+    unknown = 0
+    errors = 0
+    print("Scanning local JPGs for categorization...")
+    # Collect files
+    files: list[Path] = [f for f in _iter_media_files_shallow(destination, include_patterns, exclude_dirs)]
+    # Optional pattern filtering like pcinfo/info (glob on filename)
+    q = (query or "").strip()
+    if q:
+        pats = [p.strip() for p in q.split() if p.strip()]
+        if pats:
+            filtered = []
+            for f in files:
+                name = f.name
+                if any(fnmatch.fnmatch(name, p) for p in pats):
+                    filtered.append(f)
+            files = filtered
+            if VERBOSE:
+                print(f"DEBUG filter: patterns={pats} matched={len(files)}", flush=True)
+    batch_size = int(cfg.get('aicategory_batch_size', 8))
+    for i in range(0, len(files)):
+        pass
+    # Process batches
+    for start in range(0, len(files), batch_size):
+        batch = files[start:start+batch_size]
+        items: list[tuple[str, bytes]] = []
+        id_to_path: dict[str, Path] = {}
+        id_to_rel: dict[str, str] = {}
+        # Build thumbnails
+        for idx, f in enumerate(batch, start=1):
+            iid = f"a{start+idx:03d}"
+            rel = f.relative_to(destination).as_posix()
+            try:
+                tb = _make_thumbnail_bytes(f, max_size=256)
+            except Exception:
+                tb = None
+            if VERBOSE:
+                print(f"DEBUG file: {rel} thumb_bytes={len(tb) if tb else 0}", flush=True)
+            if not tb:
+                # mark as unknown later
+                id_to_path[iid] = f
+                id_to_rel[iid] = rel
+                continue
+            items.append((iid, tb))
+            id_to_path[iid] = f
+            id_to_rel[iid] = rel
+        if not items:
+            # Nothing usable in this batch; print unknowns for those with no thumbs
+            for iid, rel in id_to_rel.items():
+                count += 1
+                unknown += 1
+                errors += 1
+                print(f"[{count}] {rel} -> unknown (thumb-failed)")
+            continue
+        # Call batch API
+        tmo = cfg.get('aicategory_timeout_s')
+        timeout_s = float(tmo) if tmo is not None else 20.0
+        labels, err = _call_openai_category_batch(api_key, model, prompt, items, timeout_s=timeout_s, proxies=proxies, verbose=VERBOSE)
+        # Assign results
+        for iid, rel in id_to_rel.items():
+            f = id_to_path[iid]
+            label = labels.get(iid) if labels else None
+            cat = (label or '').strip() if label else ''
+            if not cat:
+                unknown += 1
+                cat_dir = view_root / 'unknown'
+            else:
+                cat_dir = view_root / _sanitize_category(cat)
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            dst = _unique_name(cat_dir, f.name)
+            try:
+                if link_type == 'symlink':
+                    os.symlink(f, dst)
+                elif link_type == 'copy':
+                    shutil.copy2(f, dst)
+                else:
+                    os.link(f, dst)
+            except Exception:
+                try:
+                    shutil.copy2(f, dst)
+                except Exception:
+                    pass
+            count += 1
+            if not cat:
+                errors += 1
+                print(f"[{count}] {rel} -> unknown ({err or 'no-label'})")
+            else:
+                print(f"[{count}] {rel} -> {cat}")
+
+        if count % 25 == 0:
+            print(f"  progress: categorized {count} files (unknown {unknown}, errors {errors})...")
+    print(f"Category view ready. total={count} unknown={unknown} errors={errors}")
 
 
 # -------------------- Update Mode Copy (keep both on size difference) --------------------
@@ -832,7 +1272,7 @@ def verify_destination(dest_root: Path, verified_path: Path, patterns: list[str]
     errors = 0
     try:
         with tmp_path.open('w', encoding='utf-8') as out:
-            for f in _iter_media_files(dest_root, patterns, exclude_dirs):
+            for f in _iter_media_files_shallow(dest_root, patterns, exclude_dirs):
                 if callable(should_abort) and should_abort():
                     raise AbortedError("Aborted during verify")
                 digest = sha256_file_cancellable(f, should_abort=should_abort)
@@ -1082,7 +1522,7 @@ def cmd_date(cfg: dict):
 
 
 def repl(cfg: dict):
-    print("i2pc REPL. Commands: copy, verify, update, date, location, remdupe, iinfo, pcinfo, help, quit")
+    print("i2pc REPL. Commands: copy, verify, update, date, location, category, remdupe, iinfo, pcinfo, verbose, help, quit")
     while True:
         try:
             raw = input("> ")
@@ -1091,7 +1531,7 @@ def repl(cfg: dict):
             break
         except KeyboardInterrupt:
             print("^C")
-            continue
+            break
         if not line:
             continue
         parts = line.split(None, 1)
@@ -1099,7 +1539,7 @@ def repl(cfg: dict):
         arg = parts[1] if len(parts) > 1 else ""
         if cmd in ('quit','exit','q'): break
         if cmd in ('help','h','?'):
-            print("Commands:\n  copy       - Copy all photos\n  verify     - Rebuild verification ledger\n  update     - Copy new or size-changed files (keep both)\n  date       - Create a date directory containing files sorted by date.\n  location   - Create a location directory grouping by Country/State/City and, when needed, by YYYY-MM. (GPS-only; local files)\n  remdupe    - Remove duplicate files\n  iinfo *    - Show file info for all files on the iPhone, or choose a subset via *.jpg (for example)\n  pcinfo *   - Show file info for all files in destination, or choose a subset via *.jpg (for example)\n  quit       - Exit")
+            print("Commands:\n  copy       - Copy all photos\n  verify     - Rebuild verification ledger\n  update     - Copy new or size-changed files (keep both)\n  date       - Create a date directory containing files sorted by date.\n  location   - Create a location directory grouping by Country/State/City and, when needed, by YYYY-MM. (GPS-only; local files)\n  category * - Categorize JPGs matching a pattern (e.g., IMG_1234.JPG or *.jpg); builds the category directory\n  remdupe    - Remove duplicate files\n  iinfo *    - Show file info for all files on the iPhone, or choose a subset via *.jpg (for example)\n  pcinfo *   - Show file info for all files in destination, or choose a subset via *.jpg (for example)\n  verbose [on|off] - Toggle verbose debug output (shows AI request metadata; never prints API key)\n  quit       - Exit")
             continue
         try:
             if cmd == 'copy':
@@ -1112,12 +1552,24 @@ def repl(cfg: dict):
                 cmd_date(cfg)
             elif cmd == 'location':
                 cmd_location(cfg)
+            elif cmd == 'category':
+                cmd_category(cfg, arg)
             elif cmd == 'remdupe':
                 cmd_remdupe(cfg)
             elif cmd in ('info','iinfo'):
                 cmd_info(cfg, arg)
             elif cmd == 'pcinfo':
                 cmd_pcinfo(cfg, arg)
+            elif cmd == 'verbose':
+                global VERBOSE
+                a = (arg or '').strip().lower()
+                if a in ('on','1','true','yes'):
+                    VERBOSE = True
+                elif a in ('off','0','false','no'):
+                    VERBOSE = False
+                else:
+                    VERBOSE = not VERBOSE
+                print(f"Verbose is now {'ON' if VERBOSE else 'OFF'}")
             
             else:
                 print("Unknown command. Type 'help' for options.")
@@ -1870,7 +2322,7 @@ def cmd_pcinfo(cfg: dict, query: str):
 
     matched = 0
     print(f"Searching destination for: {q}")
-    for f in _iter_media_files(destination, include_patterns, exclude_dirs):
+    for f in _iter_media_files_shallow(destination, include_patterns, exclude_dirs):
         name = f.name
         name_low = name.lower()
         stem_low = f.stem.lower()
