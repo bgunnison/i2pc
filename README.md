@@ -22,9 +22,9 @@ A small Python app for Windows that copies media from a USB‑connected iPhone t
     - `copy`   — Copy all photos to `destination` (uses fast-skip per config).
     - `verify` — Recompute SHA-256 for each destination file and rebuild `verified.txt`.
     - `update` — Copy new or size-changed files; keep both by auto-numbering (Windows-style).
-    - `date`   — Create a `date` directory containing files sorted by date.
-    - `category` — Create a `category` directory grouping JPGs by content using an AI model. Requires `OPENAI_API_KEY` in `private.json`, and in `aicategorize.json` provide a JSON object containing the model and a system message, e.g.: `{ "model": "gpt-4o-mini", "messages":[{"role":"system","content":"<your instruction>"}] }`. Each JPG is thumbnailed (~320px) before sending. On timeout or API error, the photo is placed under `category/unknown`.
-    - `location` — Create a `location` directory grouping files with GPS into `Country/State/City[/YYYY-MM]`. Uses reverse geocoding; ignores files with no GPS.
+    - `date`   — Create/update a `date` directory containing files sorted by date (non-destructive).
+    - `category` — Create a `category` directory grouping JPG/PNG/HEIC by content using an AI model. Requires `OPENAI_API_KEY` in `private.json`, and in `aicategorize.json` provide a JSON object containing the model and a system message, e.g.: `{ "model": "gpt-4o-mini", "messages":[{"role":"system","content":"<your instruction>"}] }`. Each image is thumbnailed (~256–320px) before sending. On timeout or API error, the photo is placed under `category/errored`; true AI unknowns go under `category/unknown`.
+    - `location` — Create/update a `location` directory grouping files with GPS into `Country/State/City[/YYYY-MM]` (non-destructive). Uses reverse geocoding; ignores files with no GPS.
     - `remdupe` — Delete duplicate files.
     - `iinfo *` — Show file info for all files on the iPhone, or choose a subset via `*.jpg` (for example).
     - `pcinfo *` — Show file info for all files in destination, or choose a subset via `*.jpg` (for example).

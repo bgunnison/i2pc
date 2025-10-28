@@ -58,3 +58,10 @@ Fallback policy:
 - Do not add fallback behavior or alternate data sources in code changes unless explicitly requested by the user in this conversation.
 - Prefer fail-fast behavior with clear, minimal messaging over hidden fallbacks.
 - Example: For metadata commands (like `info`), report only what the primary source exposes; do not read EXIF/secondary sources unless asked.
+
+Tone and humor policy:
+
+- Default tone: clear, concise, and friendly.
+- Humor level: approximately 70% of baseline — light, occasional quips that never obscure instructions or diagnostics.
+- Never let humor reduce clarity, precision, or safety. Technical content and action items take priority.
+- Honor user requests to adjust tone (e.g., “humor up/down”) within these constraints.

@@ -16,10 +16,23 @@ import re
 import math
 from typing import Optional
 
+# Verbose debug flag for AI requests
+VERBOSE = False
+
 try:
     import requests  # type: ignore
 except Exception:
     requests = None
+
+# Register HEIF/HEIC opener for Pillow when available
+try:
+    import pillow_heif  # type: ignore
+    try:
+        pillow_heif.register_heif_opener()  # type: ignore
+    except Exception:
+        pass
+except Exception:
+    pass
 
 
 class NavigationError(Exception):
@@ -380,8 +393,8 @@ def _unique_name(dst_dir: Path, base_name: str) -> Path:
 
 def build_reference_view_date(dest_root: Path, patterns: list[str], link_type: str = 'hardlink', view_name: str = 'date') -> None:
     view_root = dest_root / view_name
-    # Rebuild view fresh to avoid stale entries
-    _ensure_empty_dir(view_root)
+    # Non-destructive: ensure folder exists; do not wipe existing contents
+    ensure_dir(view_root)
 
     exclude = {view_root}
     # Create map date_key -> list[Path]
@@ -395,7 +408,10 @@ def build_reference_view_date(dest_root: Path, patterns: list[str], link_type: s
         out_dir = view_root / key
         out_dir.mkdir(parents=True, exist_ok=True)
         for src in files:
-            dst = _unique_name(out_dir, src.name)
+            # If a file with the same name already exists in the date folder, skip to avoid duplicates
+            dst = out_dir / src.name
+            if dst.exists():
+                continue
             try:
                 if link_type == 'symlink':
                     os.symlink(src, dst)
@@ -611,7 +627,8 @@ def _reverse_geocode(lat: float, lon: float, geocoder, cache: dict, timeout_s: f
 
 def build_location_view(dest_root: Path, patterns: list[str], link_type: str = 'hardlink', view_name: str = 'location') -> None:
     view_root = dest_root / view_name
-    _ensure_empty_dir(view_root)
+    # Non-destructive: ensure folder exists; do not wipe existing contents
+    ensure_dir(view_root)
 
     try:
         from geopy.geocoders import Nominatim  # type: ignore
@@ -1006,9 +1023,8 @@ def cmd_category(cfg: dict, query: str = ""):
         return
 
     view_root = destination / 'category'
-    _ensure_empty_dir(view_root)
 
-    include_patterns = ["*.jpg", "*.jpeg"]
+    include_patterns = ["*.jpg", "*.jpeg", "*.png", "*.heic", "*.heif"]
     exclude_dirs: set[Path] = {view_root, destination / '.i2pc_tmp'}
 
     # Optional HTTPS proxy from config
@@ -1028,12 +1044,23 @@ def cmd_category(cfg: dict, query: str = ""):
     count = 0
     unknown = 0
     errors = 0
-    print("Scanning local JPGs for categorization...")
-    # Collect files
-    files: list[Path] = [f for f in _iter_media_files_shallow(destination, include_patterns, exclude_dirs)]
+    print("Scanning local JPG/PNG/HEIC files for categorization...")
+    # Modes: normal or 'errored' (retries files in category/errored)
+    errored_mode = (query.strip().lower() == 'errored')
+    # Ensure view dirs exist; never wipe
+    ensure_dir(view_root)
+    unknown_dir = view_root / 'unknown'
+    errored_dir = view_root / 'errored'
+    ensure_dir(unknown_dir)
+    ensure_dir(errored_dir)
+    if errored_mode:
+        files = [p for p in (list(errored_dir.iterdir()) if errored_dir.exists() else []) if p.is_file() and any(fnmatch.fnmatch(p.name, pat) for pat in include_patterns)]
+    else:
+        # Collect files from destination root
+        files: list[Path] = [f for f in _iter_media_files_shallow(destination, include_patterns, exclude_dirs)]
     # Optional pattern filtering like pcinfo/info (glob on filename)
     q = (query or "").strip()
-    if q:
+    if q and (not errored_mode):
         pats = [p.strip() for p in q.split() if p.strip()]
         if pats:
             filtered = []
@@ -1044,7 +1071,8 @@ def cmd_category(cfg: dict, query: str = ""):
             files = filtered
             if VERBOSE:
                 print(f"DEBUG filter: patterns={pats} matched={len(files)}", flush=True)
-    batch_size = int(cfg.get('aicategory_batch_size', 8))
+    # Use smaller batch size for retrying errored
+    batch_size = int(cfg.get('aicategory_retry_batch_size', 2) if errored_mode else cfg.get('aicategory_batch_size', 8))
     for i in range(0, len(files)):
         pass
     # Process batches
@@ -1072,10 +1100,15 @@ def cmd_category(cfg: dict, query: str = ""):
             id_to_path[iid] = f
             id_to_rel[iid] = rel
         if not items:
-            # Nothing usable in this batch; print unknowns for those with no thumbs
+            # Nothing usable in this batch; place in errored for those with no thumbs
             for iid, rel in id_to_rel.items():
+                f = id_to_path[iid]
+                dst = _unique_name(errored_dir, f.name)
+                try:
+                    shutil.copy2(f, dst)
+                except Exception:
+                    pass
                 count += 1
-                unknown += 1
                 errors += 1
                 print(f"[{count}] {rel} -> unknown (thumb-failed)")
             continue
@@ -1088,34 +1121,87 @@ def cmd_category(cfg: dict, query: str = ""):
             f = id_to_path[iid]
             label = labels.get(iid) if labels else None
             cat = (label or '').strip() if label else ''
-            if not cat:
-                unknown += 1
-                cat_dir = view_root / 'unknown'
-            else:
-                cat_dir = view_root / _sanitize_category(cat)
-            cat_dir.mkdir(parents=True, exist_ok=True)
-            dst = _unique_name(cat_dir, f.name)
-            try:
-                if link_type == 'symlink':
-                    os.symlink(f, dst)
-                elif link_type == 'copy':
-                    shutil.copy2(f, dst)
+            if errored_mode:
+                # Move out of unknown on success; keep in unknown otherwise
+                if not cat:
+                    errors += 1
                 else:
-                    os.link(f, dst)
-            except Exception:
+                    cat_dir = view_root / _sanitize_category(cat)
+                    cat_dir.mkdir(parents=True, exist_ok=True)
+                    dst = _unique_name(cat_dir, f.name)
+                    try:
+                        os.replace(str(f), str(dst))  # f is in errored dir
+                    except Exception:
+                        try:
+                            shutil.copy2(f, dst)
+                            # remove old unknown file
+                            try:
+                                f.unlink()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+            else:
+                # Normal mode: create link/copy into category or unknown
+                if not cat:
+                    if err:
+                        errors += 1
+                        cat_dir = errored_dir
+                    else:
+                        unknown += 1
+                        cat_dir = view_root / 'unknown'
+                else:
+                    cat_dir = view_root / _sanitize_category(cat)
+                cat_dir.mkdir(parents=True, exist_ok=True)
+                dst = _unique_name(cat_dir, f.name)
                 try:
-                    shutil.copy2(f, dst)
+                    if link_type == 'symlink':
+                        os.symlink(f, dst)
+                    elif link_type == 'copy':
+                        shutil.copy2(f, dst)
+                    else:
+                        os.link(f, dst)
                 except Exception:
-                    pass
+                    try:
+                        shutil.copy2(f, dst)
+                    except Exception:
+                        pass
+                if cat:
+                    # update ledger
+                    try:
+                        # Reconstruct relk same as earlier
+                        relk = rel
+                        # Initialize ledger if not present
+                        try:
+                            labels_ledger
+                        except NameError:
+                            pass
+                        else:
+                            labels_ledger[relk] = cat
+                    except Exception:
+                        pass
             count += 1
             if not cat:
-                errors += 1
-                print(f"[{count}] {rel} -> unknown ({err or 'no-label'})")
+                if err and not errored_mode:
+                    print(f"[{count}] {rel} -> unknown (error: {err})")
+                else:
+                    print(f"[{count}] {rel} -> unknown ({err or 'no-label'})")
             else:
                 print(f"[{count}] {rel} -> {cat}")
 
         if count % 25 == 0:
             print(f"  progress: categorized {count} files (unknown {unknown}, errors {errors})...")
+    # Save/update ledger if present
+    try:
+        ledger_path
+        labels_ledger
+    except NameError:
+        pass
+    else:
+        try:
+            ledger_path.write_text(json.dumps(labels_ledger, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
     print(f"Category view ready. total={count} unknown={unknown} errors={errors}")
 
 
