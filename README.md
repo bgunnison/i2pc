@@ -17,7 +17,6 @@ Features include sorting media by date and location. Media can also be sorted by
   - `subfolders`: Recurse into subfolders.
   - `preserve_subfolders`: Keep the immediate parent folder name under destination.
   - `verified_file`: Name of the verification ledger (default `verified.txt`).
-  - Do not store secrets here. Put your `OPENAI_API_KEY` in `private.json` (see below).
 - Run the app:
   - `python src/i2pc.py`
   - Commands:
@@ -25,18 +24,14 @@ Features include sorting media by date and location. Media can also be sorted by
     - `verify` — Recompute SHA-256 for each destination file and rebuild `verified.txt`.
     - `update` — Copy new or size-changed files; keep both by auto-numbering (Windows-style).
     - `date`   — Create/update a `date` directory containing files sorted by date.
-    - `category` — Create a `category` directory grouping JPG/PNG/HEIC by content using an AI model. Requires `OPENAI_API_KEY` in `private.json`, and in `aicategorize.json` provide a JSON object containing the model and a system message. Each image is thumbnailed before sending. On timeout or API error, the photo is placed under `category/errored`; true AI unknowns go under `category/unknown`.
+    - `category *` — Create a `category` directory grouping media by content using an AI model. Requires `OPENAI_API_KEY` in `private.json`. Each image is thumbnailed before sending. On timeout or API error, the media is placed under `category/errored`; true AI unknowns go under `category/unknown`.
+    - `category errored` — Will retry media in `category/errored`.
     - `location` — Create/update a `location` directory grouping files with GPS into `Country/State/City[/YYYY-MM]`.
     - `remdupe` — Delete duplicate files.
     - `iinfo *` — Show file info for all files on the iPhone, or choose a subset via `*.jpg` (for example).
     - `pcinfo *` — Show file info for all files in destination, or choose a subset via `*.jpg` (for example).
     - `verbose [on|off]` — Toggle verbose debug output (prints AI request metadata and payload sizes; never prints API key).
     - `quit`   — Exit.
-
-## What “verification” means here
-
-- After each file is copied via the Windows Shell (supports MTP), the app computes a SHA‑256 hash of the copied file and appends an entry to `verified.txt` as `<sha256>\t<relative_path>`.
-- If the source item exposes its size, the app compares the destination file size to the source size to detect incomplete copies.
 
 ## Notes
 
